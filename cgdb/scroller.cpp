@@ -76,9 +76,10 @@ static char *parse(struct scroller *scr, struct hl_line_attr **attrs,
     static const int tab_size = cgdbrc_get_int(CGDBRC_TABSTOP);
     int tabcount = count(buf, buflen, '\t');
     int orig_len = strlen(orig);
-    int length = MAX(orig_len, scr->current.pos) + buflen +
+    const int length = MAX(orig_len, scr->current.pos) + buflen +
         (tab_size - 1) * tabcount + 1;
-    char rv[length] = {};
+    char rv[length];
+    memset(rv, 0, sizeof(rv));
     int i, j;
     int debugwincolor = cgdbrc_get_int(CGDBRC_DEBUGWINCOLOR);
     int width, height;
