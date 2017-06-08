@@ -14,23 +14,7 @@
 #ifndef _SOURCES_H_
 #define _SOURCES_H_
 
-#if HAVE_CONFIG_H
-#include "config.h"
-#endif /* HAVE_CONFIG_H */
-
-/* System Includes */
-#if HAVE_CURSES_H
-#include <curses.h>
-#elif HAVE_NCURSES_CURSES_H
-#include <ncurses/curses.h>
-#endif /* HAVE_CURSES_H */
-
-/* System Includes */
-#if HAVE_TIME_H
-#include <time.h>
-#endif /* HAVE_TIME_H */
-
-#include "tokenizer.h"
+#include "sys_win.h"
 
 /* ----------- */
 /* Definitions */
@@ -58,14 +42,42 @@ struct sviewer {
     struct list_node *cur;                 /* Current node we're displaying */
     sviewer_mark global_marks[MARK_COUNT]; /* Global A-Z marks */
     sviewer_mark jump_back_mark;           /* Location where last jump occurred from */
-    WINDOW *win;                           /* Curses window */
+
+    SWINDOW *win;                          /* Curses window */
+    uint64_t addr_frame;                   /* Current frame address 
+                                              Zero if unknown. */
+    /**
+     * The last regular expression searched for.
+     *
+     * This is useful with the hlsearch option. In this case,
+     * CGDB will display all of the matches to the last regular
+     * expression searched for.
+     */
+    struct hl_regex_info *last_hlregex;
+
+    /**
+     * The current regular expression being searched for.
+     *
+     * This is the active regular expression being searched for. It is
+     * interactive, as the user updates the regular expression they
+     * would like to use for searching, CGDB highlights the text in
+     * the source that represents the next match.
+     */
+    struct hl_regex_info *hlregex;
+};
+
+struct source_line {
+    char *line;
+    int len;
+    struct hl_line_attr *attrs;
 };
 
 struct buffer {
-    char **tlines;              /* Stretchy buffer array containing lines of file */
-    char *cur_line;             /* cur line may have unique color */
+    struct source_line *lines;  /* Stretch buffer array with line information */
+    uint64_t *addrs;            /* The list of corresponding addresses */
     int max_width;              /* Width of longest line in file */
     char *file_data;            /* Entire file pointer if read in that way */
+    int tabstop;                /* Tabstop value used to load file */
     enum tokenizer_language_support language;   /* The language type of this file */
 };
 
@@ -74,20 +86,13 @@ struct line_flags {
     unsigned char has_mark : 1;
 };
 
-struct list_node;
 struct list_node {
     char *path;                 /* Full path to source file */
-    char *lpath;                /* Relative path to source file */
-    struct buffer *buf;         /* Current buffer - points to color_buf or orig_buf */
-    struct buffer color_buf;    /* Color file buffer */
-    struct buffer orig_buf;     /* Original File buffer ( no color ) */
+    struct buffer file_buf;     /* File buffer */
     line_flags *lflags;         /* Breakpoints */
     int sel_line;               /* Current line selected in viewer */
     int sel_col;                /* Current column selected in viewer */
     int exe_line;               /* Current line executing, or -1 if not set */
-
-    int sel_col_rbeg;           /* Current beg column matched in regex */
-    int sel_col_rend;           /* Current end column matched in regex */
     int sel_rline;              /* Current line used by regex */
 
     enum tokenizer_language_support language;   /* The language type of this file */
@@ -95,6 +100,9 @@ struct list_node {
     time_t last_modification;   /* timestamp of last modification */
 
     int local_marks[MARK_COUNT];/* Line numbers for local (a..z) marks */
+
+    uint64_t addr_start;        /* Disassembly start address */
+    uint64_t addr_end;          /* Disassembly end address */
 
     struct list_node *next;     /* Pointer to next link in list */
 };
@@ -106,14 +114,9 @@ struct list_node {
 /* source_new:  Create a new source viewer object.
  * -----------
  *
- *   pos_r:   Position of the viewer (row)
- *   pos_c:   Position of the viewer (column)
- *   height:  Height (in lines) of the viewer
- *   width:   Width (in columns) of the viewer
- *
- * Return Value:  A new sviewer object on success, NULL on failure.
+ * Return Value:  A new sviewer object on success.
  */
-struct sviewer *source_new(int pos_r, int pos_c, int height, int width);
+struct sviewer *source_new(SWINDOW *window);
 
 /* source_add:  Add a file to the list of source files.
  * -----------
@@ -122,24 +125,15 @@ struct sviewer *source_new(int pos_r, int pos_c, int height, int width);
  *   path:   Full path to the source file (this is considered to be a
  *           unique identifier -- no duplicate paths in the list!)
  *
- * Return Value:  Zero on success, non-zero on error.
+ * Return Value:  pointer to your brand new node.
  */
-int source_add(struct sviewer *sview, const char *path);
+struct list_node *source_add(struct sviewer *sview, const char *path);
+
+void source_add_disasm_line(struct list_node *node, const char *line);
 
 int source_highlight(struct list_node *node);
 
-/* source_set_relative_path: Sets the path that gdb uses for breakpoints
- * -------------------------
- * 
- *   sview:  Source viewer object
- *   path:   Full path to the source file (this is considered to be a
- *           unique identifier -- no duplicate paths in the list!)
- *   lpath:  
- *
- * Return Value:  Zero on success, non-zero on error.
- */
-int source_set_relative_path(struct sviewer *sview,
-        const char *path, const char *lpath);
+struct list_node *source_get_node(struct sviewer *sview, const char *path);
 
 /* source_del:  Remove a file from the list of source files.
  * -----------
@@ -170,7 +164,7 @@ int source_length(struct sviewer *sview, const char *path);
  *  Return Value: NULL if no file is being displayed, otherwise a pointer to
  *                the current path of the file being displayed.
  */
-char *source_current_file(struct sviewer *sview, char *path);
+char *source_current_file(struct sviewer *sview);
 
 /* source_display:  Display a portion of a file in a curses window.
  * ---------------
@@ -182,17 +176,15 @@ char *source_current_file(struct sviewer *sview, char *path);
  */
 int source_display(struct sviewer *sview, int focus, enum win_refresh dorefresh);
 
-/* source_move:  Relocate the source window.
- * ------------
+/* Relocate the source window.
  *
- *   sview:   Source viewer object
- *   pos_r:   Position of the viewer (row)
- *   pos_c:   Position of the viewer (column)
- *   height:  Height (in lines) of the viewer
- *   width:   Width (in columns) of the viewer
+ * @param sview
+ * Source viewer object
+ *
+ * @param win
+ * The new window
  */
-void source_move(struct sviewer *sview,
-        int pos_r, int pos_c, int height, int width);
+void source_move(struct sviewer *sview, SWINDOW *win);
 
 /* source_vscroll:  Change current position in source file.
  * --------------
@@ -232,34 +224,41 @@ void source_set_sel_line(struct sviewer *sview, int line);
  */
 int source_set_exec_line(struct sviewer *sview, const char *path, int sel_line, int exe_line);
 
-/* source_search_regex_init: Should be called before source_search_regex
- * -------------------------
- *   This function initializes sview before it can search for a regex
- *   It should be called every time a regex will be applied to sview before
- *   source_search_regex is called.
+int source_set_exec_addr(struct sviewer *sview, uint64_t addr);
+
+/**
+ * Initialize a regular expression search in the source viewer.
  *
- *   sview:  Source viewer object
+ * This function should be called during the start of a regular expression
+ * search and before source_search_regex is called. 
+ *
+ * @param sview
+ * The source viewer object
  */
 void source_search_regex_init(struct sviewer *sview);
 
-/* source_search_regex: Searches for regex in current file and displays line.
- * ---------------
+/**
+ * Allows the user to search for a regular expression.
  *
- *   sview:  Source viewer object
- *   regex:  The regular expression to search for
- *           If NULL, then no regex will be tried, but the state can still
- *           be put back to its old self!
- *   opt:    If 1, Then the search is temporary ( User has not hit enter )
- *           If 2, The search is perminant
+ * @param sview
+ * The source viewer object
  *
- *   direction: If 0 then forward, else reverse
- *   icase:     If 0 ignore case.
+ * @param regex
+ * The regular expression to search for. If NULL, then no regex will be
+ * tried, but the state can still put back to its old self!
  *
- * Return Value: Zero on match, 
- *               -1 if sview->cur is NULL
- *               -2 if regex is NULL
- *               -3 if regcomp fails
- *               non-zero on failure.
+ * @param opt
+ * If 1, Then the search is temporary ( User has not hit enter )
+ * If 2, The search is perminant
+ *
+ * @param direction
+ * If 0 then forward, else reverse
+ *
+ * @param icase
+ * If 0 ignore case.
+ *
+ * @return
+ * Zero on match and non-zero on failure.
  */
 int source_search_regex(struct sviewer *sview, const char *regex, int opt,
         int direction, int icase);
@@ -275,30 +274,28 @@ void source_free(struct sviewer *sview);
 /* Breakpoints */
 /* ----------- */
 
-/* source_disable_break:  Disable a given breakpoint.
- * ---------------------
- *
- *   sview:  The source viewer object
- *   path:   Full path to the source file
- *   line:   Line number of breakpoint
- */
-void source_disable_break(struct sviewer *sview, const char *path, int line);
-
 /* source_enable_break:  Enable a given breakpoint.
  * --------------------
  *
- *   sview:  The source viewer object
- *   path:   Full path to the source file
- *   line:   Line number of breakpoint
+ *   sview:    The source viewer object
+ *   path:     The path to the source file, absolute if available
+ *   line:     Line number of breakpoint
+ *   enabled:  0 for disabled, otherwise enabled
  */
-void source_enable_break(struct sviewer *sview, const char *path, int line);
+void source_enable_break(struct sviewer *sview, const char *path,
+        int line, int enabled);
 
-/* source_clear_breaks:  Clear all breakpoints from all files.
- * --------------------
+/**
+ * Replace all existing breakpoints with the breakpoints provided.
  *
- *   sview:  The source viewer object
+ * @param sview
+ * The source viewer object
+ * 
+ * @param breakpoints
+ * The new breakpoints to set
  */
-void source_clear_breaks(struct sviewer *sview);
+void source_set_breakpoints(struct sviewer *sview,
+        struct tgdb_breakpoint *breakpoints);
 
 /**
  * Check's to see if the current source file has changed. If it has it loads

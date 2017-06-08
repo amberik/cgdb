@@ -34,11 +34,10 @@
 #include <errno.h>
 #endif /* HAVE_ERRNO_H */
 
-#include "fork_util.h"
 #include "sys_util.h"
+#include "fork_util.h"
 #include "fs_util.h"
 #include "pseudo.h"
-#include "logger.h"
 #include "terminal.h"
 
 struct pty_pair {
@@ -63,7 +62,7 @@ pty_pair_ptr pty_pair_create(void)
     val = pty_open(&(ptr->masterfd), &(ptr->slavefd), local_slavename,
             SLAVE_SIZE, NULL, NULL);
     if (val == -1) {
-        logger_write_pos(logger, __FILE__, __LINE__, "PTY open");
+        clog_error(CLOG_CGDB, "PTY open");
         return NULL;
     }
 
@@ -81,7 +80,7 @@ int pty_pair_destroy(pty_pair_ptr pty_pair)
     cgdb_close(pty_pair->slavefd);
 
     if (pty_release(pty_pair->slavename) == -1) {
-        logger_write_pos(logger, __FILE__, __LINE__, "pty_release error");
+        clog_error(CLOG_CGDB, "pty_release error");
         return -1;
     }
 
@@ -120,7 +119,7 @@ int pty_free_process(int *masterfd, char *sname)
     cgdb_close(*masterfd);
 
     if (pty_release(sname) == -1) {
-        logger_write_pos(logger, __FILE__, __LINE__, "pty_release error");
+        clog_error(CLOG_CGDB, "pty_release error");
         return -1;
     }
 
@@ -161,12 +160,12 @@ static int pty_free_memory(char *s, int fd, int argc, char *argv[])
     int error = 0, i;
 
     if (s && pty_release(s) == -1) {
-        logger_write_pos(logger, __FILE__, __LINE__, "pty_release failed");
+        clog_error(CLOG_CGDB, "pty_release failed");
         error = -1;
     }
 
     if (fd != -1 && close(fd) == -1) {
-        logger_write_pos(logger, __FILE__, __LINE__, "close failed");
+        clog_error(CLOG_CGDB, "close failed");
         error = -1;
     }
 
@@ -180,17 +179,18 @@ static int pty_free_memory(char *s, int fd, int argc, char *argv[])
 }
 
 int invoke_debugger(const char *path,
-        int argc, char *argv[], int *in, int *out, int choice, char *filename)
+        int argc, char *argv[], int *in, int *out, int choice)
 {
     pid_t pid;
     const char *const GDB = "gdb";
     const char *const NW = "--nw";
-    const char *const X = "-x";
+    const char *const EX = "-ex";
     const char *const ANNOTATE_TWO = "--annotate=2";
     const char *const GDBMI = "-i=mi2";
-    char *F = filename;
+    const char *const SET_ANNOTATE_TWO = "set annotate 2";
+    const char *const SET_HEIGHT_ZERO = "set height 0";
     char **local_argv;
-    int i, j = 0, extra = 6;
+    int i, j = 0, extra = 8;
     int malloc_size = argc + extra;
     char slavename[64];
     int masterfd;
@@ -209,14 +209,17 @@ int invoke_debugger(const char *path,
      */
     local_argv[j++] = cgdb_strdup(NW);
 
+    local_argv[j++] = cgdb_strdup(EX);
+    local_argv[j++] = cgdb_strdup(SET_ANNOTATE_TWO);
+
+    local_argv[j++] = cgdb_strdup(EX);
+    local_argv[j++] = cgdb_strdup(SET_HEIGHT_ZERO);
+
     /* add the init file that the user did not type */
     if (choice == 0)
         local_argv[j++] = cgdb_strdup(ANNOTATE_TWO);
     else if (choice == 1)
         local_argv[j++] = cgdb_strdup(GDBMI);
-
-    local_argv[j++] = cgdb_strdup(X);
-    local_argv[j++] = cgdb_strdup(F);
 
     /* copy in all the data the user entered */
     for (i = 0; i < argc; i++)
@@ -225,17 +228,23 @@ int invoke_debugger(const char *path,
     local_argv[j] = NULL;
 
     if (fs_util_file_exists_in_path(local_argv[0]) == -1) {
-        logger_write_pos(logger, __FILE__, __LINE__,
-                         "Debugger \"%s\" not found", local_argv[0]);
+        clog_error(CLOG_CGDB, "Debugger \"%s\" not found", local_argv[0]);
         pty_free_memory(slavename, masterfd, argc, local_argv);
         return -1;
     }
+
+    /* Log the gdb invocation line */
+    clog_info(CLOG_GDBIO, "Invoking program:");
+    for (i = 0; i < j; i++) {
+        clog_info(CLOG_GDBIO, "  argv[%d]=%s ", i, local_argv[i]);
+    }
+
     /* Fork into two processes with a shared pty pipe */
     pid = pty_fork(&masterfd, slavename, SLAVE_SIZE, NULL, NULL);
 
     if (pid == -1) {            /* error, free memory and return  */
         pty_free_memory(slavename, masterfd, argc, local_argv);
-        logger_write_pos(logger, __FILE__, __LINE__, "fork failed");
+        clog_error(CLOG_CGDB, "fork failed");
         return -1;
     } else if (pid == 0) {      /* child */
         FILE *fd = fopen(slavename, "r");

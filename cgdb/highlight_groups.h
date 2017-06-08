@@ -33,6 +33,7 @@ enum hl_group_kind {
     HLG_COMMENT,
     HLG_DIRECTIVE,
     HLG_TEXT,
+    HLG_INCSEARCH,
     HLG_SEARCH,
     HLG_STATUS_BAR,
     HLG_EXECUTING_LINE_ARROW,
@@ -143,7 +144,7 @@ int hl_groups_shutdown(hl_groups_ptr hl_groups);
 int hl_groups_setup(hl_groups_ptr hl_groups);
 
 /**
- * Get the attributes that may be passed to wattron to tell the curses library
+ * Get the attributes that may be passed to swin_wattron to tell the curses library
  * how to print this particular group.
  *
  * Note, this function can not fail.
@@ -201,7 +202,68 @@ struct hl_line_attr {
     int col;
     int attr;
 };
-void hl_printline(WINDOW *win, const char *line, int line_len,
+
+/**
+ * Print a line with highlighting.
+ *
+ * @param win
+ * The window to write to.
+ *
+ * @param line
+ * The line to write.
+ *
+ * @param line_len
+ * The length of the line to write.
+ *
+ * @param attrs
+ * The attributes to write.
+ *
+ * @param x
+ * The x position to write to, -1 for current position.
+ *
+ * @param y
+ * The y position to write to, -1 for current position.
+ *
+ * @param col
+ * The column to write to.
+ *
+ * @param width
+ */
+void hl_printline(SWINDOW *win, const char *line, int line_len,
+        const hl_line_attr *attrs, int x, int y, int col, int width);
+
+/**
+ * Print a line with highlighting.
+ *
+ * This differs from hl_printline by only printing the text with attributes.
+ * This is useful if you want to first print the line with syntax
+ * highlighting and then do another pass with regex highlighting (or some
+ * other attributes to highlight on top of the syntax).
+ *
+ * @param win
+ * The window to write to.
+ *
+ * @param line
+ * The line to write.
+ *
+ * @param line_len
+ * The length of the line to write.
+ *
+ * @param attrs
+ * The attributes to write.
+ *
+ * @param x
+ * The x position to write to, -1 for current position.
+ *
+ * @param y
+ * The y position to write to, -1 for current position.
+ *
+ * @param col
+ * The column to write to.
+ *
+ * @param width
+ */
+void hl_printline_highlight(SWINDOW *win, const char *line, int line_len,
         const hl_line_attr *attrs, int x, int y, int col, int width);
 
 /*@}*/

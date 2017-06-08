@@ -26,12 +26,6 @@
 #include <stdio.h>
 #endif /* HAVE_STDIO_H */
 
-#if HAVE_CURSES_H
-#include <curses.h>
-#elif HAVE_NCURSES_CURSES_H
-#include <ncurses/curses.h>
-#endif /* HAVE_CURSES_H */
-
 #ifdef HAVE_SYS_TIME_H
 #include <sys/time.h>
 #endif
@@ -64,9 +58,14 @@
 #include <ctype.h>
 #endif
 
+#define __STDC_FORMAT_MACROS
+#include <inttypes.h>
+
 /* Local Includes */
+#include "sys_util.h"
+#include "sys_win.h"
 #include "cgdb.h"
-#include "logger.h"
+#include "tokenizer.h"
 #include "interface.h"
 #include "scroller.h"
 #include "sources.h"
@@ -76,14 +75,11 @@
 #include "fs_util.h"
 #include "cgdbrc.h"
 #include "io.h"
-#include "tgdb_list.h"
 #include "fork_util.h"
 #include "terminal.h"
-#include "queue.h"
 #include "rline.h"
 #include "ibuf.h"
 #include "usage.h"
-#include "sys_util.h"
 
 /* --------- */
 /* Constants */
@@ -98,7 +94,6 @@ const char *readline_history_filename = "readline_history.txt";
 /* --------------- */
 
 struct tgdb *tgdb;              /* The main TGDB context */
-struct tgdb_request *last_request = NULL;
 
 char cgdb_home_dir[MAXLINE];    /* Path to home directory with trailing slash */
 char *readline_history_path;    /* After readline init is called, this will 
@@ -194,7 +189,7 @@ static int is_tab_completing = 0;
  * to tell GDB that the user wants to enter more data on the next line.
  *
  * For this reason, CGDB keeps this buffer. It adds the command the user
- * is typeing to this buffer. When a line comes that does not end in a \,
+ * is typing to this buffer. When a line comes that does not end in a \,
  * then the command is sent to GDB.
  */
 static struct ibuf *current_line = NULL;
@@ -280,58 +275,28 @@ static int is_gdb_tui_command(const char* line)
         "layo",
         "layou",
         "layout",
+        "tui" /* tui enable */
     };
 
     /* Skip leading white space */
     while (isspace(*line))
         line++;
     if (*line) {
+        size_t cmd_len;
         const char *cmd_end = line + 1;
 
         /* Find end of command */
         while (*cmd_end && !isspace(*cmd_end))
             cmd_end++;
 
+        cmd_len = cmd_end - line;
         for (i = 0; i < sizeof(tui_commands) / sizeof(tui_commands[0]); i++)
         {
-            if (!strncasecmp(line, tui_commands[i], cmd_end - line))
+            size_t len = strlen(tui_commands[i]);
+
+            if ((len == cmd_len) && !strncasecmp(line, tui_commands[i], len))
                 return 1;
         }
-    }
-
-    return 0;
-}
-
-/**
- * If the TGDB instance is not busy, it will run the requested command.
- * Otherwise, the command will get queued to run later.
- *
- * \param tgdb_in
- * An instance of the tgdb library to operate on.
- *
- * \param request
- * The requested command to have TGDB process.
- *
- * \return
- * 0 on success or -1 on error
- */
-int handle_request(struct tgdb *tgdb_in, struct tgdb_request *request)
-{
-    int val, is_busy;
-
-    if (!tgdb_in || !request)
-        return -1;
-
-    val = tgdb_is_busy(tgdb_in, &is_busy);
-    if (val == -1)
-        return -1;
-
-    if (is_busy)
-        tgdb_queue_append(tgdb_in, request);
-    else {
-        tgdb_request_destroy(last_request);
-        last_request = request;
-        tgdb_process_command(tgdb_in, request);
     }
 
     return 0;
@@ -352,26 +317,20 @@ int run_shell_command(const char *command)
     int rv;
 
     /* Cleanly scroll the screen up for a prompt */
-    scrl(1);
-    move(LINES - 1, 0);
+    swin_scrl(1);
+    swin_move(swin_lines() - 1, 0);
     printf("\n");
 
     /* Put the terminal in cooked mode and turn on echo */
-    endwin();
+    swin_endwin();
     tty_set_attributes(STDIN_FILENO, &term_attributes);
 
     /* NULL or empty string means invoke user's shell */
-    if (command == NULL || strlen(command) == 0) {
-
+    if (!command || !command[0]) {
         /* Check for SHELL environment variable */
         char *shell = getenv("SHELL");
 
-        if (shell == NULL) {
-            /* Run /bin/sh instead */
-            rv = system("/bin/sh");
-        } else {
-            rv = system(shell);
-        }
+        rv = system(shell ? shell : "/bin/sh");
     } else {
         /* Execute the command passed in via system() */
         rv = system(command);
@@ -407,7 +366,6 @@ void rlctx_send_user_command(char *line)
     const char *cline;
     int length;
     char *rline_prompt;
-    tgdb_request_ptr request_ptr;
 
     if (line == NULL) {
         /* NULL line means rl_callback_read_char received EOF */
@@ -465,13 +423,8 @@ void rlctx_send_user_command(char *line)
         rline_clear(rline);
         rline_rl_forced_update_display(rline);
     } else {
-        request_ptr = tgdb_request_run_console_command(tgdb, cline);
-        if (!request_ptr)
-            logger_write_pos(logger, __FILE__, __LINE__,
-                    "rlctx_send_user_command\n");
-
         /* Send this command to TGDB */
-        handle_request(tgdb, request_ptr);
+        tgdb_request_run_console_command(tgdb, cline);
     }
 
     ibuf_clear(current_line);
@@ -483,21 +436,14 @@ static int tab_completion(int a, int b)
 {
     char *cur_line;
     int ret;
-    tgdb_request_ptr request_ptr;
 
     is_tab_completing = 1;
 
     ret = rline_get_current_line(rline, &cur_line);
     if (ret == -1)
-        logger_write_pos(logger, __FILE__, __LINE__,
-                "rline_get_current_line error\n");
+        clog_error(CLOG_CGDB, "rline_get_current_line error\n");
 
-    request_ptr = tgdb_request_complete(tgdb, cur_line);
-    if (!request_ptr)
-        logger_write_pos(logger, __FILE__, __LINE__,
-                "tgdb_request_complete error\n");
-
-    handle_request(tgdb, request_ptr);
+    tgdb_request_complete(tgdb, cur_line);
     return 0;
 }
 
@@ -689,7 +635,6 @@ static int handle_tab_completion_request(tab_completion_ptr comptr, int key)
         tab_completion_destroy(completion_ptr);
         completion_ptr = NULL;
         is_tab_completing = 0;
-        rline_rl_forced_update_display(rline);
     }
 
     return 0;
@@ -706,26 +651,27 @@ readline_completion_display_func(char **matches, int num_matches,
     /* Create the tab completion item, and attempt to display it to the user */
     completion_ptr = tab_completion_create(matches, num_matches, max_length);
     if (!completion_ptr)
-        logger_write_pos(logger, __FILE__, __LINE__,
-                "tab_completion_create error\n");
+        clog_error(CLOG_CGDB, "tab_completion_create error\n");
 
     if (handle_tab_completion_request(completion_ptr, -1) == -1)
-        logger_write_pos(logger, __FILE__, __LINE__,
-                "handle_tab_completion_request error\n");
+        clog_error(CLOG_CGDB, "handle_tab_completion_request error\n");
 }
 
-int do_tab_completion(struct tgdb_list *list)
+int do_tab_completion(char **completions)
 {
-    if (rline_rl_complete(rline, list, &readline_completion_display_func) == -1) {
-        logger_write_pos(logger, __FILE__, __LINE__,
-                "rline_rl_complete error\n");
+    int ret;
+
+    ret = rline_rl_complete(rline, completions, &readline_completion_display_func);
+    if (ret == -1)
+    {
+        clog_error(CLOG_CGDB, "rline_rl_complete error\n");
         return -1;
     }
 
-  /** 
-   * If completion_ptr is non-null, then this means CGDB still has to display
-   * the completion to the user. is_tab_completing can not be turned off until
-   * the completions are displayed to the user. */
+    /** 
+     * If completion_ptr is non-null, then this means CGDB still has to display
+     * the completion to the user. is_tab_completing can not be turned off until
+     * the completions are displayed to the user. */
     if (!completion_ptr)
         is_tab_completing = 0;
 
@@ -858,8 +804,7 @@ static int init_home_dir(void)
 
     /* Create the config directory */
     if (!fs_util_create_dir_in_base(home_dir, cgdb_dir)) {
-        logger_write_pos(logger, __FILE__, __LINE__,
-                "fs_util_create_dir_in_base error");
+        clog_error(CLOG_CGDB, "fs_util_create_dir_in_base error");
         return -1;
     }
 
@@ -868,12 +813,66 @@ static int init_home_dir(void)
     return 0;
 }
 
+/**
+ * Console output has returned from GDB, show it.
+ *
+ * @param context
+ * Unused at the moment
+ *
+ * @param str
+ * The console output to display
+ */
+static void console_output(void *context, const std::string &str) {
+    if_print(str.c_str());
+}
+
+/**
+ * The console is ready for another command.
+ */
+static void console_ready(void *context)
+{
+    rline_rl_forced_update_display(rline);
+}
+
+static void request_sent(void *context, struct tgdb_request *request,
+        const std::string &command) 
+{
+    if (request->header == TGDB_REQUEST_CONSOLE_COMMAND &&
+        request->choice.console_command.queued) {
+        char *prompt;
+        rline_get_prompt(rline, &prompt);
+        if (prompt) {
+            if_print(prompt);
+        }
+        if_print(request->choice.console_command.command);
+        if_print("\n");
+    } else if (request->header == TGDB_REQUEST_DEBUGGER_COMMAND) {
+        if_print("\n");
+    }
+    
+    if (cgdbrc_get_int(CGDBRC_SHOWDEBUGCOMMANDS)) {
+        if_sdc_print(command.c_str());
+    }
+}
+
+
+static void command_response(void *context, struct tgdb_response *response);
+            
+tgdb_callbacks callbacks = { 
+    NULL,       
+    console_output,
+    console_ready,
+    request_sent,
+    command_response
+};
+
+
 /* start_gdb: Starts up libtgdb
  *  Returns:  -1 on error, 0 on success
  */
 static int start_gdb(int argc, char *argv[])
 {
-    tgdb = tgdb_initialize(debugger_path, argc, argv, &gdb_fd);
+    tgdb = tgdb_initialize(debugger_path, argc, argv, &gdb_fd, callbacks);
     if (tgdb == NULL)
         return -1;
 
@@ -888,10 +887,10 @@ static void send_key(int focus, char key)
 
         masterfd = pty_pair_get_masterfd(pty_pair);
         if (masterfd == -1)
-            logger_write_pos(logger, __FILE__, __LINE__, "send_key error");
+            clog_error(CLOG_CGDB, "send_key error");
         size = write(masterfd, &key, sizeof (char));
         if (size != 1)
-            logger_write_pos(logger, __FILE__, __LINE__, "send_key error");
+            clog_error(CLOG_CGDB, "send_key error");
     } else if (focus == 2) {
         tgdb_send_inferior_char(tgdb, key);
     }
@@ -905,6 +904,12 @@ static int user_input(void)
 {
     static int key, val;
 
+    val = kui_manager_clear_map_set(kui_ctx);
+    if (val == -1) {
+        clog_error(CLOG_CGDB, "Could not clear the map set");
+        return -1;
+    }
+
     if (if_get_focus() == CGDB)
         val = kui_manager_set_map_set(kui_ctx, kui_map);
     else if (if_get_focus() == GDB)
@@ -912,15 +917,14 @@ static int user_input(void)
 
     key = kui_manager_getkey(kui_ctx);
     if (key == -1) {
-        logger_write_pos(logger, __FILE__, __LINE__,
-                "kui_manager_getkey error");
+        clog_error(CLOG_CGDB, "kui_manager_getkey error");
         return -1;
     }
 
     val = if_input(key);
 
     if (val == -1) {
-        logger_write_pos(logger, __FILE__, __LINE__, "if_input error");
+        clog_error(CLOG_CGDB, "if_input error");
         return -1;
     } else if (val != 1 && val != 2)
         return 0;
@@ -933,8 +937,8 @@ static int user_input(void)
         const char *seqbuf = kui_term_get_ascii_char_sequence_from_key(key);
 
         if (seqbuf == NULL) {
-            logger_write_pos(logger, __FILE__, __LINE__,
-                    "kui_term_get_ascii_char_sequence_from_key error %d", key);
+            clog_error(CLOG_CGDB,
+                "kui_term_get_ascii_char_sequence_from_key error %d", key);
             return -1;
         } else {
             int length = strlen(seqbuf), i;
@@ -969,8 +973,7 @@ static int user_input_loop()
             return 0;
 
         if (user_input() == -1) {
-            logger_write_pos(logger, __FILE__, __LINE__,
-                    "user_input_loop failed");
+            clog_error(CLOG_CGDB, "user_input_loop failed");
             return -1;
         }
     } while (kui_manager_cangetkey(kui_ctx));
@@ -978,197 +981,224 @@ static int user_input_loop()
     return 0;
 }
 
-static void process_commands(struct tgdb *tgdb_in)
+/* This updates all the breakpoints */
+static void update_breakpoints(struct tgdb_response *response)
 {
-    struct tgdb_response *item;
+    source_set_breakpoints(if_get_sview(),
+        response->choice.update_breakpoints.breakpoints);
+    if_show_file(NULL, 0, 0);
+}
 
-    while ((item = tgdb_get_response(tgdb_in)) != NULL) {
-        switch (item->header) {
-                /* This updates all the breakpoints */
-            case TGDB_UPDATE_BREAKPOINTS:
-            {
-                struct sviewer *sview = if_get_sview();
-                char *file;
-                struct tgdb_list *list =
-                        item->choice.update_breakpoints.breakpoint_list;
-                tgdb_list_iterator *iterator;
-                struct tgdb_breakpoint *tb;
+/* This means a source file or line number changed */
+static void update_file_position(struct tgdb_response *response)
+{
+    /**
+     * Updating the location that cgdb should point the user to.
+     *
+     * A variety of different locations can come back from gdb.
+     * We currently have the following fields of interest:
+     *   path, line number and address.
+     *
+     * The path may be NULL, relative or absolute. When it is
+     * relative or absolute, it might point to a file that does
+     * not exist on disk.
+     *
+     * The address or line number are not always available.
+     *
+     * So currently, our best bet is to
+     * - show the file/line
+     * - if file/line unavailable, show the function disassembly
+     * - if function disassembly unavailable, show disassembly
+     * - if disassembly unavailable, show nothing
+     */
+    struct tgdb_file_position *tfp;
+    struct sviewer *sview = if_get_sview();
+    int source_reload_status = -1;
 
-                source_clear_breaks(if_get_sview());
-                iterator = tgdb_list_get_first(list);
+    tfp = response->choice.update_file_position.file_position;
+    
+    /* Tell source viewer what the current $pc address is. */
+    sview->addr_frame = tfp->addr;
 
-                while (iterator) {
-                    /* For each breakpoint */
-                    tb = (struct tgdb_breakpoint *)
-                            tgdb_list_get_item(iterator);
+    /* If we got a pathname and we're not showing disasm... */
+    if (tfp->path && !cgdbrc_get_int(CGDBRC_DISASM)) {
 
-                    file = tb->file;
+        /**
+         * GDB will provide an executing line number even when the program
+         * has not been started yet. Checking the frame address as well
+         * helps cgdb to not show an executing line unless there is a stack,
+         * which tells us the inferior is running.
+         */
+        int exe_line = sview->addr_frame ? tfp->line_number : -1;
 
-                    if (tb->enabled)
-                        source_enable_break(sview, file, tb->line);
-                    else
-                        source_disable_break(sview, file, tb->line);
+        /* Update the file */
+        source_reload_status = 
+            source_reload(if_get_sview(), tfp->path, 0);
 
-                    iterator = tgdb_list_next(iterator);
-                }
+        /* Show the source file at this line number */
+        if_show_file(tfp->path, tfp->line_number, exe_line);
+    }
 
-                if_show_file(NULL, 0, 0);
-                break;
-            }
+    /**
+     * Sometimes gdb provides a path that can not be found
+     * on disk. For instance, for glibc where the source isn't
+     * available. In this scenario, show the assembly instead.
+     */
+    if (source_reload_status == -1 && sview->addr_frame) {
+        int ret;
 
-                /* This means a source file or line number changed */
-            case TGDB_UPDATE_FILE_POSITION:
-            {
-                struct tgdb_file_position *tfp;
+        /* Try to show the disasm for the current $pc address */
+        ret = source_set_exec_addr(sview, sview->addr_frame);
 
-                tfp = item->choice.update_file_position.file_position;
-
-                /* Update the file */
-                source_reload(if_get_sview(), tfp->absolute_path, 0);
-
-                if_show_file(tfp->absolute_path, tfp->line_number, tfp->line_number);
-
-                source_set_relative_path(if_get_sview(),
-                        tfp->absolute_path, tfp->relative_path);
-
-                break;
-            }
-
-                /* This is a list of all the source files */
-            case TGDB_UPDATE_SOURCE_FILES:
-            {
-                struct tgdb_list *list =
-                        item->choice.update_source_files.source_files;
-                tgdb_list_iterator *i = tgdb_list_get_first(list);
-                char *s;
-
-                if_clear_filedlg();
-
-                while (i) {
-                    s = (char *)tgdb_list_get_item(i);
-                    if_add_filedlg_choice(s);
-                    i = tgdb_list_next(i);
-                }
-
-                if_set_focus(FILE_DLG);
-                kui_input_acceptable = 1;
-                break;
-            }
-
-                /* The user is trying to get a list of source files that make up
-                 * the debugged program but libtgdb is claiming that gdb knows
-                 * none. */
-            case TGDB_SOURCES_DENIED:
-                if_display_message("Error:", WIN_REFRESH, 0,
-                        " No sources available! Was the program compiled with debug?");
-                kui_input_acceptable = 1;
-                break;
-
-                /* This is the absolute path to the last file the user requested */
-            case TGDB_FILENAME_PAIR:
-            {
-                const char *apath = item->choice.filename_pair.absolute_path;
-                const char *rpath = item->choice.filename_pair.relative_path;
-
-                if_show_file((char *) apath, 0, 0);
-                source_set_relative_path(if_get_sview(), apath, rpath);
-                break;
-            }
-
-                /* The source file requested does not exist */
-            case TGDB_ABSOLUTE_SOURCE_DENIED:
-            {
-                struct tgdb_source_file *file =
-                        item->choice.absolute_source_denied.source_file;
-
-                if_show_file(NULL, 0, 0);
-
-                /* com can be NULL when tgdb orig requests main file */
-                if (file->absolute_path != NULL)
-                    if_display_message("No such file:", WIN_REFRESH, 0, " %s",
-                            file->absolute_path);
-                break;
-            }
-            case TGDB_INFERIOR_EXITED:
-            {
-                /*
-                 * int *status = item->data;
-                 * This could eventually go here, but for now, the update breakpoint 
-                 * display function makes the status bar go back to the name of the file.
-                 *
-                 * if_display_message ( "Program exited with value", WIN_REFRESH, 0, " %d", *status );
-                 */
-
-                /* Clear the cache */
-                break;
-            }
-            case TGDB_UPDATE_COMPLETIONS:
-            {
-                struct tgdb_list *list =
-                        item->choice.update_completions.completion_list;
-                do_tab_completion(list);
-                break;
-            }
-            case TGDB_UPDATE_CONSOLE_PROMPT_VALUE:
-            {
-                const char *new_prompt =
-                        item->choice.update_console_prompt_value.prompt_value;
-                change_prompt(new_prompt);
-                break;
-            }
-            case TGDB_QUIT:
-                cleanup();
-                exit(0);
-                break;
-                /* Default */
-            default:
-                break;
+        if (!ret) {
+            if_draw();
+        } else if (sview->addr_frame) {
+            /* No disasm found - request it */
+            tgdb_request_disassemble_func(tgdb,
+                DISASSEMBLE_FUNC_SOURCE_LINES);
         }
     }
 }
 
-/**
- * This function looks at the request that CGDB has made and determines if it 
- * effects the GDB console window. For instance, if the request makes output go
- * to that window, then the user would like to see another prompt there when the 
- * command finishes. However, if the command is 'o', to get all the sources and 
- * display them, then this doesn't effect the GDB console window and the window
- * should not redisplay the prompt.
- *
- * \param request
- * The request to analysize
- *
- * \param update
- * Will return as 1 if the console window should be updated, or 0 otherwise
- *
- * \return
- * 0 on success or -1 on error
- */
-static int
-does_request_require_console_update(struct tgdb_request *request, int *update)
+/* This is a list of all the source files */
+static void update_source_files(struct tgdb_response *response)
 {
-    if (!request || !update)
-        return -1;
+    char **source_files = response->choice.update_source_files.source_files;
+    sviewer *sview = if_get_sview();
+    struct list_node *cur;
+    int added_disasm = 0;
 
-    switch (request->header) {
-        case TGDB_REQUEST_CONSOLE_COMMAND:
-            *update = 1;
-            break;
-        case TGDB_REQUEST_INFO_SOURCES:
-        case TGDB_REQUEST_FILENAME_PAIR:
-        case TGDB_REQUEST_CURRENT_LOCATION:
-            *update = 0;
-            break;
-        case TGDB_REQUEST_DEBUGGER_COMMAND:
-        case TGDB_REQUEST_MODIFY_BREAKPOINT:
-        case TGDB_REQUEST_COMPLETE:
-            *update = 1;
-            break;
-        default:
-            return -1;
+    if_clear_filedlg();
+
+    /* Search for a node which contains this address */
+    for (cur = sview->list_head; cur != NULL; cur = cur->next) {
+        if (cur->path[0] == '*')
+        {
+            added_disasm = 1;
+            if_add_filedlg_choice(cur->path);
+        }
     }
 
-    return 0;
+    if (!sbcount(source_files) && !added_disasm) {
+        /* No files returned? */
+        if_display_message("Error:", WIN_REFRESH, 0,
+                           " No sources available! Was the program compiled with debug?");
+    } else {
+        int i;
+
+        for (i = 0; i < sbcount(source_files); i++) {
+            if_add_filedlg_choice(source_files[i]);
+        }
+
+        if_set_focus(FILE_DLG);
+    }
+    kui_input_acceptable = 1;
+}
+
+static void update_completions(struct tgdb_response *response)
+{
+    do_tab_completion(response->choice.update_completions.completions);
+}
+
+static void update_disassemble(struct tgdb_response *response)
+{
+    if (response->choice.disassemble_function.error) {
+        //$ TODO mikesart: Get module name in here somehow? Passed in when calling tgdb_request_disassemble?
+        //      or info sharedlibrary?
+        //$ TODO mikesart: Need way to make sure we don't recurse here on error.
+        //$ TODO mikesart: 100 lines? Way to load more at end?
+
+        if (response->header == TGDB_DISASSEMBLE_PC) {
+            /* Spew out a warning about disassemble failing
+             * and disasm next 100 instructions. */
+            if_print_message("\nWarning: dissasemble address 0x%" PRIx64 " failed.\n",
+                response->choice.disassemble_function.addr_start);
+        } else {
+            tgdb_request_disassemble_pc(tgdb, 100);
+        }
+    } else {
+        uint64_t addr_start = response->choice.disassemble_function.addr_start;
+        uint64_t addr_end = response->choice.disassemble_function.addr_end;
+        char **disasm = response->choice.disassemble_function.disasm;
+
+        //$ TODO: If addr_start is equal to addr_end of some other
+        // buffer, then append it to that buffer?
+
+        //$ TODO: If there is a disassembly view, update the location
+        // even if we don't display it? Useful with global marks, etc.
+
+        if (disasm && disasm[0]) {
+            int i;
+            char *path;
+            struct list_node *node;
+            sviewer *sview = if_get_sview();
+
+            if (addr_start) {
+                path = sys_aprintf(
+                    "** %s (%" PRIx64 " - %" PRIx64 ") **",
+                    disasm[0], addr_start, addr_end);
+            } else {
+                path = sys_aprintf("** %s **", disasm[0]);
+            }
+
+            node = source_get_node(sview, path);
+            if (!node) {
+                node = source_add(sview, path);
+
+                //$ TODO mikesart: Add asm colors
+                node->language = TOKENIZER_LANGUAGE_ASM;
+                node->addr_start = addr_start;
+                node->addr_end = addr_end;
+
+                for (i = 0; i < sbcount(disasm); i++) {
+                    source_add_disasm_line(node, disasm[i]);
+                }
+
+                source_highlight(node);
+            }
+
+            source_set_exec_addr(sview, sview->addr_frame);
+            if_draw();
+
+            free(path);
+        }
+    }
+}
+
+static void update_prompt(struct tgdb_response *response)
+{
+    change_prompt(response->choice.update_console_prompt_value.prompt_value);
+}
+
+static void command_response(void *context, struct tgdb_response *response)
+{
+    switch (response->header)
+    {
+    case TGDB_UPDATE_BREAKPOINTS:
+        update_breakpoints(response);
+        break;
+    case TGDB_UPDATE_FILE_POSITION:
+        update_file_position(response);
+        break;
+    case TGDB_UPDATE_SOURCE_FILES:
+        update_source_files(response);
+        break;
+    case TGDB_UPDATE_COMPLETIONS:
+        update_completions(response);
+        break;
+    case TGDB_DISASSEMBLE_PC:
+    case TGDB_DISASSEMBLE_FUNC:
+        update_disassemble(response);
+        break;
+    case TGDB_UPDATE_CONSOLE_PROMPT_VALUE:
+        update_prompt(response);
+        break;
+    case TGDB_QUIT:
+        cgdb_cleanup_and_exit(0);
+        break;
+    default:
+        break;
+    }
 }
 
 /* gdb_input: Receives data from tgdb:
@@ -1177,87 +1207,13 @@ does_request_require_console_update(struct tgdb_request *request, int *update)
  */
 static int gdb_input()
 {
-    int size;
-    int is_finished;
-    char buf[GDB_MAXBUF + 1];
+    int result;
 
     /* Read from GDB */
-    size = tgdb_process(tgdb, buf, GDB_MAXBUF, &is_finished);
-    if (size == -1) {
-        logger_write_pos(logger, __FILE__, __LINE__,
-                "tgdb_recv_debugger_data error");
+    result = tgdb_process(tgdb);
+    if (result == -1) {
+        clog_error(CLOG_CGDB, "tgdb_process error");
         return -1;
-    }
-
-    buf[size] = 0;
-
-    process_commands(tgdb);
-
-    /* Display GDB output 
-     * The strlen check is here so that if_print does not get called
-     * when displaying the filedlg. If it does get called, then the 
-     * gdb window gets displayed when the filedlg is up
-     */
-    if (strlen(buf) > 0)
-        if_print(buf);
-
-    /* Check to see if GDB is ready to receive another command. If it is, then
-     * readline should redisplay what it currently contains. There are 2 special
-     * case's here.
-     *
-     * If there are no commands in the queue to send to GDB then readline 
-     * should simply redisplay what it has currently in it's buffer.
-     * rl_forced_update_display does this.
-     *
-     * However, if there are commands in the queue to send to GDB, that means
-     * the user already entered these through readline. In that case, simply 
-     * write the command entered through readline directly, instead of having
-     * readline do it (readline already processed the data). This is important
-     * also because rl_forced_update_display doesn't write the data right away.
-     * It writes data to rl_outstream, and then the main_loop handles both the
-     * readline data and the data from the TGDB command being sent. This could
-     * result in a race condition.
-     */
-    if (is_finished) {
-
-        tgdb_queue_size(tgdb, &size);
-        /* This is the second case, this command was queued. */
-        if (size > 0) {
-            struct tgdb_request *request = tgdb_queue_pop(tgdb);
-            char *prompt;
-
-            rline_get_prompt(rline, &prompt);
-            if_print(prompt);
-
-            if (request->header == TGDB_REQUEST_CONSOLE_COMMAND) {
-                if_print(request->choice.console_command.command);
-                if_print("\n");
-            }
-
-            tgdb_request_destroy(last_request);
-            last_request = request;
-            tgdb_process_command(tgdb, request);
-
-            /* This is the first case */
-        }
-      /** If the user is currently completing, do not update the prompt */
-        else if (!completion_ptr) {
-            int update = 1, ret_val;
-
-            if (last_request) {
-                ret_val =
-                        does_request_require_console_update(last_request,
-                        &update);
-                if (ret_val == -1)
-                    return -1;
-
-                tgdb_request_destroy(last_request);
-                last_request = NULL;
-            }
-
-            if (update)
-                rline_rl_forced_update_display(rline);
-        }
     }
 
     return 0;
@@ -1271,14 +1227,13 @@ static int readline_input()
     int masterfd = pty_pair_get_masterfd(pty_pair);
 
     if (masterfd == -1) {
-        logger_write_pos(logger, __FILE__, __LINE__,
-                "pty_pair_get_masterfd error");
+        clog_error(CLOG_CGDB, "pty_pair_get_masterfd error");
         return -1;
     }
 
     size = read(masterfd, buf, GDB_MAXBUF);
     if (size == -1) {
-        logger_write_pos(logger, __FILE__, __LINE__, "read error");
+        clog_error(CLOG_CGDB, "read error");
         return -1;
     }
 
@@ -1307,8 +1262,7 @@ static ssize_t child_input()
     /* Read from GDB */
     size = tgdb_recv_inferior_data(tgdb, buf, GDB_MAXBUF);
     if (size == -1) {
-        logger_write_pos(logger, __FILE__, __LINE__,
-                "tgdb_recv_inferior_data error ");
+        clog_error(CLOG_CGDB, "tgdb_recv_inferior_data error ");
         return -1;
     }
     buf[size] = 0;
@@ -1323,7 +1277,7 @@ static int cgdb_resize_term(int fd)
     int c, result;
 
     if (read(fd, &c, sizeof (int)) < sizeof (int)) {
-        logger_write_pos(logger, __FILE__, __LINE__, "read from resize pipe");
+        clog_error(CLOG_CGDB, "read from resize pipe");
         return -1;
     }
 
@@ -1333,7 +1287,7 @@ static int cgdb_resize_term(int fd)
      */
     result = io_data_ready(fd, 0);
     if (result == -1) {
-        logger_write_pos(logger, __FILE__, __LINE__, "io_data_ready");
+        clog_error(CLOG_CGDB, "io_data_ready");
         return -1;
     }
 
@@ -1341,7 +1295,7 @@ static int cgdb_resize_term(int fd)
         return 0;
 
     if (if_resize_term() == -1) {
-        logger_write_pos(logger, __FILE__, __LINE__, "if_resize_term error");
+        clog_error(CLOG_CGDB, "if_resize_term error");
         return -1;
     }
 
@@ -1366,7 +1320,7 @@ static int cgdb_handle_signal_in_main_loop(int fd)
     int signo;
 
     if (read(fd, &signo, sizeof(int)) < sizeof(int)) {
-        logger_write_pos(logger, __FILE__, __LINE__, "read from signal pipe");
+        clog_error(CLOG_CGDB, "read from signal pipe");
         return -1;
     }
 
@@ -1387,15 +1341,13 @@ static int main_loop(void)
 
     masterfd = pty_pair_get_masterfd(pty_pair);
     if (masterfd == -1) {
-        logger_write_pos(logger, __FILE__, __LINE__,
-                "pty_pair_get_masterfd error");
+        clog_error(CLOG_CGDB, "pty_pair_get_masterfd error");
         return -1;
     }
 
     slavefd = pty_pair_get_slavefd(pty_pair);
     if (slavefd == -1) {
-        logger_write_pos(logger, __FILE__, __LINE__,
-                "pty_pair_get_slavefd error");
+        clog_error(CLOG_CGDB, "pty_pair_get_slavefd error");
         return -1;
     }
 
@@ -1445,8 +1397,7 @@ static int main_loop(void)
             if (errno == EINTR)
                 continue;
             else {
-                logger_write_pos(logger, __FILE__, __LINE__,
-                        "select failed: %s", strerror(errno));
+                clog_error(CLOG_CGDB, "select failed: %s", strerror(errno));
                 return -1;
             }
         }
@@ -1539,18 +1490,15 @@ static int main_loop(void)
 /* Exposed Functions */
 /* ----------------- */
 
-/* cleanup: Invoked by the various err_xxx funtions when dying.
+/* cgdb_cleanup_and_exit: Invoked by the various err_xxx funtions when dying.
  * -------- */
-void cleanup()
+void cgdb_cleanup_and_exit(int val)
 {
-    char *log_file, *tmp_log_file;
-    int has_recv_data;
-
     ibuf_free(current_line);
 
     /* Cleanly scroll the screen up for a prompt */
-    scrl(1);
-    move(LINES - 1, 0);
+    swin_scrl(1);
+    swin_move(swin_lines() - 1, 0);
     printf("\n");
 
     rline_write_history(rline, readline_history_path);
@@ -1572,28 +1520,34 @@ void cleanup()
      * TGDB guarantees the logger to be open at this point.
      * So, we can get the filename directly from the logger 
      */
-    logger_get_file(logger, &tmp_log_file);
-    log_file = strdup(tmp_log_file);
-    logger_has_recv_data(logger, &has_recv_data);
 
     /* Shut down debugger */
     tgdb_shutdown(tgdb);
 
     if (tty_set_attributes(STDIN_FILENO, &term_attributes) == -1)
-        logger_write_pos(logger, __FILE__, __LINE__, "tty_reset error");
+        clog_error(CLOG_CGDB, "tty_reset error");
 
-    if (has_recv_data)
+    /* Close our logfiles */
+    tgdb_close_logfiles();
+
+    /**
+     * If the cgdb log file has non-zero size, alert the user.
+     */
+    const char *log_filename = clog_filename(CLOG_CGDB_ID);
+    long log_bytes_written = get_file_size_by_name(log_filename);
+    if (log_bytes_written > 0)
+    {
         fprintf(stderr, "CGDB had unexpected results, see %s for details.\n",
-                log_file);
+            log_filename);
+    }
 
-    free(log_file);
-    log_file = NULL;
+    exit(val);
 }
 
 int init_resize_pipe(void)
 {
     if (pipe(resize_pipe) == -1) {
-        logger_write_pos(logger, __FILE__, __LINE__, "pipe error");
+        clog_error(CLOG_CGDB, "pipe error");
         return -1;
     }
 
@@ -1605,7 +1559,7 @@ int init_signal_pipe(void)
     int result = pipe(signal_pipe);
 
     if (result == -1) {
-        logger_write_pos(logger, __FILE__, __LINE__, "pipe error");
+        clog_error(CLOG_CGDB, "pipe error");
     }
 
     return result;
@@ -1652,8 +1606,7 @@ int create_and_init_pair()
 
     slavefd = pty_pair_get_slavefd(pty_pair);
     if (slavefd == -1) {
-        logger_write_pos(logger, __FILE__, __LINE__,
-                "pty_pair_get_slavefd error");
+        clog_error(CLOG_CGDB, "pty_pair_get_slavefd error");
         return -1;
     }
 
@@ -1712,42 +1665,34 @@ int init_kui(void)
     kui_ctx = kui_manager_create(STDIN_FILENO, cgdbrc_get_key_code_timeoutlen(),
             cgdbrc_get_mapped_key_timeoutlen());
     if (!kui_ctx) {
-        logger_write_pos(logger, __FILE__, __LINE__,
-                "Unable to initialize input library");
-        cleanup();
-        exit(-1);
+        clog_error(CLOG_CGDB, "Unable to initialize input library");
+        cgdb_cleanup_and_exit(-1);
     }
 
     kui_map = kui_ms_create();
     if (!kui_map) {
-        logger_write_pos(logger, __FILE__, __LINE__,
-                "Unable to initialize input library");
-        cleanup();
-        exit(-1);
+        clog_error(CLOG_CGDB, "Unable to initialize input library");
+        cgdb_cleanup_and_exit(-1);
     }
 
     kui_imap = kui_ms_create();
     if (!kui_imap) {
-        logger_write_pos(logger, __FILE__, __LINE__,
-                "Unable to initialize input library");
-        cleanup();
-        exit(-1);
+        clog_error(CLOG_CGDB, "Unable to initialize input library");
+        cgdb_cleanup_and_exit(-1);
     }
 
     if (kui_manager_set_map_set(kui_ctx, kui_map) == -1) {
-        logger_write_pos(logger, __FILE__, __LINE__,
-                "Unable to initialize input library");
-        cleanup();
-        exit(-1);
+        clog_error(CLOG_CGDB, "Unable to initialize input library");
+        cgdb_cleanup_and_exit(-1);
     }
 
     /* Combine the cgdbrc config package with libkui. If any of the options
      * below change, update the KUI.  Currently, the handles are not kept around,
      * because CGDB never plans on detaching. */
-    cgdbrc_attach(CGDBRC_TIMEOUT, &update_kui, NULL);
-    cgdbrc_attach(CGDBRC_TIMEOUT_LEN, &update_kui, NULL);
-    cgdbrc_attach(CGDBRC_TTIMEOUT, &update_kui, NULL);
-    cgdbrc_attach(CGDBRC_TTIMEOUT_LEN, &update_kui, NULL);
+    cgdbrc_attach(CGDBRC_TIMEOUT, &update_kui);
+    cgdbrc_attach(CGDBRC_TIMEOUT_LEN, &update_kui);
+    cgdbrc_attach(CGDBRC_TTIMEOUT, &update_kui);
+    cgdbrc_attach(CGDBRC_TTIMEOUT_LEN, &update_kui);
 
     /* It's important that CGDB uses readline's view of 
      * Home and End keys. A few distros I've run into (redhat e3
@@ -1772,6 +1717,12 @@ int init_kui(void)
     add_readline_key_sequence("backward-word", CGDB_KEY_BACKWARD_WORD);
     /* Forward-word */
     add_readline_key_sequence("forward-word", CGDB_KEY_FORWARD_WORD);
+    /* Backword-Kill-Word */
+    add_readline_key_sequence(
+            "backward-kill-word", CGDB_KEY_BACKWARD_KILL_WORD);
+    /* Forward-Kill-word */
+    add_readline_key_sequence(
+            "kill-word", CGDB_KEY_FORWARD_KILL_WORD);
 
     return 0;
 }
@@ -1815,28 +1766,23 @@ int main(int argc, char *argv[])
 
     /* Create the home directory */
     if (init_home_dir() == -1) {
-        logger_write_pos(logger, __FILE__, __LINE__,
-                "Unable to create home dir ~/.cgdb");
-        cleanup();
-        exit(-1);
+        clog_error(CLOG_CGDB, "Unable to create home dir ~/.cgdb");
+        cgdb_cleanup_and_exit(-1);
     }
 
     if (init_readline() == -1) {
-        logger_write_pos(logger, __FILE__, __LINE__, "Unable to init readline");
-        cleanup();
-        exit(-1);
+        clog_error(CLOG_CGDB, "Unable to init readline");
+        cgdb_cleanup_and_exit(-1);
     }
 
     if (tty_cbreak(STDIN_FILENO, &term_attributes) == -1) {
-        logger_write_pos(logger, __FILE__, __LINE__, "tty_cbreak error");
-        cleanup();
-        exit(-1);
+        clog_error(CLOG_CGDB, "tty_cbreak error");
+        cgdb_cleanup_and_exit(-1);
     }
 
     if (init_kui() == -1) {
-        logger_write_pos(logger, __FILE__, __LINE__, "init_kui error");
-        cleanup();
-        exit(-1);
+        clog_error(CLOG_CGDB, "init_kui error");
+        cgdb_cleanup_and_exit(-1);
     }
 
     /* Parse the cgdbrc file. Note that we are doing this before
@@ -1847,47 +1793,27 @@ int main(int argc, char *argv[])
     parse_cgdbrc_file();
 
     /* Initialize the display */
-    switch (if_init()) {
-        case 1:
-            logger_write_pos(logger, __FILE__, __LINE__,
-                    "Unable to initialize the curses library");
-            cleanup();
-            exit(-1);
-        case 2:
-            logger_write_pos(logger, __FILE__, __LINE__,
-                    "Unable to handle signal: SIGWINCH");
-            cleanup();
-            exit(-1);
-        case 3:
-            logger_write_pos(logger, __FILE__, __LINE__,
-                    "Unable to setup highlighting groups");
-            cleanup();
-            exit(-1);
-        case 4:
-            logger_write_pos(logger, __FILE__, __LINE__,
-                    "New GDB window failed -- out of memory?");
-            cleanup();
-            exit(-1);
+    if (if_init() == -1)
+    {
+        clog_error(CLOG_CGDB, "if_init() failed.");
+        cgdb_cleanup_and_exit(-1);
     }
 
     /* Initialize the pipe that is used for resize */
     if (init_resize_pipe() == -1) {
-        logger_write_pos(logger, __FILE__, __LINE__, "init_resize_pipe error");
-        cleanup();
-        exit(-1);
+        clog_error(CLOG_CGDB, "init_resize_pipe error");
+        cgdb_cleanup_and_exit(-1);
     }
 
     /* Initialize the pipe that is used for signals */
     if (init_signal_pipe() == -1) {
-        logger_write_pos(logger, __FILE__, __LINE__, "init_signal_pipe error");
-        cleanup();
-        exit(-1);
+        clog_error(CLOG_CGDB, "init_signal_pipe error");
+        cgdb_cleanup_and_exit(-1);
     }
 
     /* Enter main loop */
     main_loop();
 
     /* Shut down curses and exit */
-    cleanup();
-    return 0;
+    cgdb_cleanup_and_exit(0);
 }

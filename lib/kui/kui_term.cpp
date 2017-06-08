@@ -2,12 +2,6 @@
 #include "config.h"
 #endif /* HAVE_CONFIG_H */
 
-#if HAVE_CURSES_H
-#include <curses.h>
-#elif HAVE_NCURSES_CURSES_H
-#include <ncurses/curses.h>
-#endif /* HAVE_CURSES_H */
-
 #if HAVE_STRING_H
 #include <string.h>
 #endif /* HAVE_STRING_H */
@@ -34,6 +28,8 @@
 EXTERN_C int tgetent(char *, const char *);
 EXTERN_C char *tgetstr(const char *, char **);
 
+#include "sys_util.h"
+#include "sys_win.h"
 #include "kui_term.h"
 
 #define MAXLINE 4096
@@ -134,7 +130,9 @@ struct keydata {
             /* Passed through to readline */
     {
     CGDB_KEY_BACKWARD_WORD, "\033b"}, {
-    CGDB_KEY_FORWARD_WORD, "\033f"},
+    CGDB_KEY_FORWARD_WORD, "\033f"}, {
+    CGDB_KEY_BACKWARD_KILL_WORD, "\033\b"}, {
+    CGDB_KEY_FORWARD_KILL_WORD, "\033d"},
             /* Ctrl bindings */
     {
     CGDB_KEY_CTRL_A, "\001"}, {
@@ -236,6 +234,10 @@ struct cgdb_keycode_data {
     CGDB_KEY_F12, "<F12>", "CGDB_KEY_F12"}, {
     CGDB_KEY_BACKWARD_WORD, "<BACKWARD-WORD>", "CGDB_KEY_BACKWARD_WORD"}, {
     CGDB_KEY_FORWARD_WORD, "<FORWARD-WORD>", "CGDB_KEY_FORWARD_WORD"}, {
+    CGDB_KEY_BACKWARD_KILL_WORD,
+        "<BACKWARD-KILL_WORD>", "CGDB_KEY_BACKWARD_KILL_WORD"}, {
+    CGDB_KEY_FORWARD_KILL_WORD,
+        "<FORWARD-KILL_WORD>", "CGDB_KEY_FORWARD_KILL_WORD"}, {
     CGDB_KEY_CTRL_A, "<C-a>", "CGDB_KEY_CTRL_A"}, {
     CGDB_KEY_CTRL_B, "<C-b>", "CGDB_KEY_CTRL_B"}, {
     CGDB_KEY_CTRL_C, "<C-c>", "CGDB_KEY_CTRL_C"}, {
@@ -340,7 +342,7 @@ static int import_keyseq(struct tlist *list, struct kui_map_set *map)
     }
 
     /* Set up the terminfo seq */
-    list->tiname_seq = tigetstr((char *)list->tiname);
+    list->tiname_seq = swin_tigetstr((char *)list->tiname);
     if (list->tiname_seq == 0) {
         /* fprintf ( stderr, "CAPNAME (%s) is not present in this TERM's terminfo description\n", i->tiname); */
     } else if (list->tiname_seq == (char *) -1) {

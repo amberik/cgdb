@@ -84,12 +84,8 @@ split screen showing the source as it executes.  The UI is modeled on the
 classic Unix text editor, vi.  Those familiar with vi should feel right at 
 home using CGDB.
 
-The library responsible for communicating with GDB is called Trivial GDB 
-(tgdb, or more accurately, libtgdb).  This abstraction allows the UI code to 
-be independent of the debugger, as well as greatly simplifying its 
-implementation.
-
-Those wanting to develop other interfaces to GDB are welcome to use libtgdb 
+The library responsible for communicating with GDB is called gdbwire.
+Those wanting to develop other interfaces to GDB are welcome to use gdbwire 
 as the basis for their program.  Many of the headaches of parsing GDB's output 
 and annotations can be avoided by using it.
 
@@ -226,6 +222,9 @@ finishes, they will each be run in order.  There will be no way to stop these
 commands from being run besides from typing @kbd{Ctrl-C}, like you would at any
 normal terminal when working with GDB.
 
+@cindex regular expression search
+CGDB also supports regular expression searching within the GDB window.
+
 @node File Dialog Window
 @section Understanding the file dialog window.
 @cindex file dialog window
@@ -316,6 +315,9 @@ This is defaulted to the @key{ESC} key.
 
 @item i
 Puts the user into @dfn{GDB mode}.
+
+@item s
+Puts the user into scroll mode in the @dfn{GDB mode}.
 
 @item Ctrl-T
 Opens a new tty for the debugged program.
@@ -462,6 +464,12 @@ Move up a page.
 @item page down
 Move down a page.
 
+@item Ctrl-u
+Move up 1/2 a page.
+
+@item Ctrl-d
+Move down 1/2 a page.
+
 @item F11
 @itemx home key
 @itemx gg
@@ -481,6 +489,30 @@ Move up a line.
 @itemx down arrow
 @itemx Ctrl-n
 Move down a line.
+
+@item /
+search from current cursor position.
+
+@item ?
+reverse search from current cursor position.
+
+@item n
+next forward search.
+
+@item N
+next reverse search.
+
+@item m[a-z]
+Set a mark at the cursor position. 
+
+@item '[a-z]
+Jump to the corresponding mark.
+
+@item ''
+Jump to the last jump location.
+
+@item '.
+Jump to the last line.
 
 @item q
 @itemx i
@@ -619,6 +651,16 @@ display the ANSI escape code in the debug window.
 See @uref{https://en.wikipedia.org/wiki/ANSI_escape_code#Colors} to learn
 more about ANSI escape codes.
 
+@item :set dis
+@item :set disasm
+This option is used to enable or disable showing assembly code in cgdb.
+The default value is off.  When off, CGDB will display the source code
+to the user.  When no source code is available, CGDB will display the
+assembly code.  When this option is enabled, CGDB will display the mixed
+source and assembly when the source code is enabled and assembly code
+when the source code is not available. Please note that when assembly
+mode is displayed, it's displayed per function instead of per file.
+
 @item :set eld=@var{style}
 @itemx :set executinglinedisplay=@var{style}
 Set the executing line display to @var{style}.  Possible values for @var{style}
@@ -630,6 +672,11 @@ The @samp{longarrow} option also draws an arrow next to the source line
 number, but extends the arrow until the source code.  The @samp{highlight}
 option draws the entire line in inverse video and the @samp{block} option
 draws an inverse block (cursor) next to the source code being executed.
+
+@item :set hls
+@itemx :set hlsearch
+When enabled, if there is a previous search pattern, highlight all its matches.
+The default is disabled.
 
 @item :set ic
 @itemx :set ignorecase
@@ -662,12 +709,12 @@ The default is off.
 @item :set syn=@var{style}
 @itemx :set syntax=@var{style}
 Sets the current highlighting mode of the current file to have the syntax 
-@var{style}.  Possible values for @var{syntax} are @samp{c}, @samp{d},
-@samp{go}, @samp{ada}, @samp{rust}, @samp{off}, @samp{no}, @samp{on} or
-@samp{yes}.  Normally, the user will never have to do this, since CGDB 
-automatically detects what syntax a file should be based on its file 
-extension.  However, this feature can currently be useful for debugging 
-purposes. @samp{on} and @samp{yes} enable syntax highlighting based
+@var{style}.  Possible values for @var{syntax} are @samp{c}, @samp{asm},
+@samp{d}, @samp{go}, @samp{ada}, @samp{rust}, @samp{off}, @samp{no},
+@samp{on} or @samp{yes}.  Normally, the user will never have to do this,
+since CGDB automatically detects what syntax a file should be based on
+its file extension.  However, this feature can currently be useful for
+debugging purposes. @samp{on} and @samp{yes} enable syntax highlighting based
 on the source files extension. @samp{off} and @samp{no} disable syntax
 highlighting. The remaining values set the specific language highlighters
 independent of the source files extension.
@@ -826,10 +873,6 @@ Turn the syntax on or off.
 @itemx :until
 Send an until command to GDB.
 
-@item :d
-@itemx :disassemble
-Send a disassemble command to GDB.
-
 @item :up
 Send an up command to GDB.
 
@@ -919,9 +962,13 @@ displaying it's User Interface.
 @item StatusLine
 This represents the @dfn{status bar} in CGDB.  The file dialog's status 
 bar also uses this group.
+@item Search
+This represents the group used when displaying the previous search in
+either the source window, the GDB window in scroll mode, or the @dfn{file
+dialog window}. This is only used when the @var{hlsearch} option is enabled.
 @item IncSearch
 This represents the group used when the user is searching in either the source 
-window, or the @dfn{file dialog window}.
+window, the GDB window in scroll mode, or the @dfn{file dialog window}.
 @item SelectedLineArrow
 This represents the group used when the user has the
 @code{selectedlinedisplay} set to @code{shortarrow} or @code{longarrow}.
@@ -1328,11 +1375,6 @@ flex installed.  I have used flex 2.5.4 to build CGDB.
 If you modify @file{doc/cgdb.texinfo}, then you will be required to have this 
 package installed.  I have used version 4.7 to build the documentation for 
 CGDB.
-
-@item help2man
-If you are doing a release, then you will be required to have this package
-installed.  In the @file{doc/} build directory, you can execute the command 
-@code{make cgdb.1}, and the CGDB man page will be generated.
 @end table
 
 CGDB uses autoconf/automake to build its configure scripts and makefiles.  So, 

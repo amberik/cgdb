@@ -110,13 +110,15 @@ typedef enum {
 
 /** All of the different configuration options */
 enum cgdbrc_option_kind {
-    /* Arrow style is deprecated, use CGDBRC_EXECUTING_LINE_DISPLAY insetad */
+    /* Arrow style is deprecated, use CGDBRC_EXECUTING_LINE_DISPLAY instead */
     CGDBRC_ARROWSTYLE,
     CGDBRC_AUTOSOURCERELOAD,
     CGDBRC_CGDB_MODE_KEY,
     CGDBRC_COLOR,
     CGDBRC_DEBUGWINCOLOR,
+    CGDBRC_DISASM,
     CGDBRC_EXECUTING_LINE_DISPLAY,
+    CGDBRC_HLSEARCH,
     CGDBRC_IGNORECASE,
     CGDBRC_SELECTED_LINE_DISPLAY,
     CGDBRC_SHOWDEBUGCOMMANDS,
@@ -146,6 +148,8 @@ struct cgdbrc_config_option {
         /* option_kind == CGDBRC_CGDB_MODE_KEY */
         /* option_kind == CGDBRC_COLOR */
         /* option_kind == CGDBRC_DEBUGWINCOLOR */
+        /* option_kind == CGDBRC_DISASM */
+        /* option_kind == CGDBRC_HLSEARCH */
         /* option_kind == CGDBRC_IGNORECASE */
         /* option_kind == CGDBRC_SHOWDEBUGCOMMANDS */
         /* option_kind == CGDBRC_SHOWMARKS */
@@ -187,9 +191,6 @@ typedef int (*cgdbrc_notify) (cgdbrc_config_option_ptr option);
 /**
  * This will attach a new callback function for a particular option.
  * The client will be notified when the value is changed.
- * The handle returned from this function should be used if the 
- * client ever wishes to disable the callback function from being called when 
- * an option is changed.
  *
  * \param option
  * The new option to attach a callback to.
@@ -197,28 +198,10 @@ typedef int (*cgdbrc_notify) (cgdbrc_config_option_ptr option);
  * \param notify
  * The callback function to call when the state of the data changes.
  * 
- * \param handle
- * The unique identifier to use when detaching this notification
- * If the handle is passed in as NULL, it will not be set on the way out. This
- * callback can never be removed.
- *
  * \return
  * 0 on success or -1 on error
  */
-int cgdbrc_attach(enum cgdbrc_option_kind option, cgdbrc_notify notify,
-        int *handle);
-
-/**
- * This will detach a notify function so that it will no longer be called
- * when an option is updated.
- *
- * \param handle
- * The value returned from cgdbrc_attach when the notify request was made.
- *
- * \return
- * 0 on success, -1 if it couldn't be detached (error)
- */
-int cgdbrc_detach(int handle);
+int cgdbrc_attach(enum cgdbrc_option_kind option, cgdbrc_notify notify);
 
 /* }}} */
 
